@@ -10,10 +10,31 @@ import (
 	"golang.org/x/exp/slices"
 )
 
+type Task struct {
+	cond *sync.Cond
+	done bool
+}
+
+func newTask() *Task {
+	return &Task{
+		cond: &sync.Cond{
+			L: &sync.Mutex{},
+		},
+	}
+}
+
+func (t *Task) Lock() {
+	t.cond.L.Lock()
+}
+
+func (t *Task) Unlock() {
+	t.cond.L.Unlock()
+}
+
 type token struct{}
 
 type Graph struct {
-	// string -> sync.Once
+	// string -> *Task
 	tasks *sync.Map
 
 	// string -> error
@@ -22,9 +43,14 @@ type Graph struct {
 	sem chan token
 
 	path []string
+
+	wg sync.WaitGroup
+
+	errOnce sync.Once
+	err     error
 }
 
-func (g *Graph) err(key string) error {
+func (g *Graph) error(key string) error {
 	v, ok := g.errors.Load(key)
 	if !ok || v == nil {
 		return nil
@@ -47,18 +73,23 @@ func New(limit int) *Graph {
 	return g
 }
 
-// Sub creates a subgraph from Graph and executes f.
-// Sub functions are not governed by the Graph's limit, so they should avoid doing heavy work.
-// For heavy work, use Leaf.
-func (g *Graph) Sub(ctx context.Context, key string, f func(context.Context, *Graph) error) error {
+// Do does stuff.
+func (g *Graph) Do(ctx context.Context, key string, f func(context.Context, *Graph) error) error {
 	for _, p := range g.path {
 		if p == key {
 			return fmt.Errorf("cannot execute subgraph due to cycle: %s -> %s", strings.Join(g.path, " -> "), key)
 		}
 	}
 
-	once, _ := g.tasks.LoadOrStore(key, &sync.Once{})
-	once.(*sync.Once).Do(func() {
+	v, loaded := g.tasks.LoadOrStore(key, newTask())
+	task := v.(*Task)
+	if loaded {
+		task.Lock()
+		for !task.done {
+			task.cond.Wait()
+		}
+		task.Unlock()
+	} else {
 		subpath := slices.Clone(g.path)
 		subpath = append(subpath, key)
 		subgraph := &Graph{
@@ -66,28 +97,82 @@ func (g *Graph) Sub(ctx context.Context, key string, f func(context.Context, *Gr
 			sem:   g.sem,
 			path:  subpath,
 		}
-		g.errors.Store(key, f(ctx, subgraph))
-	})
 
-	return g.err(key)
+		g.errors.Store(key, f(ctx, subgraph))
+
+		task.Lock()
+		task.done = true
+		task.Unlock()
+
+		task.cond.Broadcast()
+	}
+
+	return g.error(key)
 }
 
-// Leaf executes f, governed by the Graph's limit.
-func (g *Graph) Leaf(ctx context.Context, key string, f func(context.Context) error) error {
+// Go is like Do but async.
+func (g *Graph) Go(ctx context.Context, key string, f func(context.Context, *Graph) error) {
 	for _, p := range g.path {
 		if p == key {
-			return fmt.Errorf("cannot execute leaf due to cycle: %s -> %s", strings.Join(g.path, " -> "), key)
+			g.errOnce.Do(func() {
+				g.err = fmt.Errorf("cannot execute subgraph due to cycle: %s -> %s", strings.Join(g.path, " -> "), key)
+			})
+			return
 		}
 	}
 
-	once, _ := g.tasks.LoadOrStore(key, &sync.Once{})
-	once.(*sync.Once).Do(func() {
+	v, loaded := g.tasks.LoadOrStore(key, newTask())
+	task := v.(*Task)
+	if loaded {
+		task.Lock()
+		if task.done {
+			task.Unlock()
+			return
+		}
+
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+
+			for !task.done {
+				task.cond.Wait()
+			}
+			task.Unlock()
+		}()
+	} else {
+		subpath := slices.Clone(g.path)
+		subpath = append(subpath, key)
+		subgraph := &Graph{
+			tasks: g.tasks,
+			sem:   g.sem,
+			path:  subpath,
+		}
+
 		if g.sem != nil {
 			g.sem <- token{}
 		}
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
 
-		g.errors.Store(key, f(ctx))
-	})
+			err := f(ctx, subgraph)
+			g.errors.Store(key, err)
+			g.errOnce.Do(func() {
+				g.err = err
+			})
 
-	return g.err(key)
+			task.Lock()
+			task.done = true
+			task.Unlock()
+
+			<-g.sem
+
+			task.cond.Broadcast()
+		}()
+	}
+}
+
+func (g *Graph) Wait() error {
+	g.wg.Wait()
+	return g.err
 }
