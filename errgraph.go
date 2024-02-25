@@ -33,7 +33,11 @@ func (t *Task) Unlock() {
 
 type token struct{}
 
+// TODO: Generic key.
+// TODO: Results?
+// TODO: Separate dedupe from everything else?
 type Graph struct {
+	// global to the graph
 	// string -> *Task
 	tasks *sync.Map
 
@@ -42,9 +46,11 @@ type Graph struct {
 
 	sem chan token
 
+	// local to this subgraph
 	path []string
 
-	wg sync.WaitGroup
+	// string -> *Task
+	waiting *sync.Map
 
 	errOnce sync.Once
 	err     error
@@ -63,7 +69,10 @@ func (g *Graph) error(key string) error {
 // Functions are deduplicated by their key string and will return whatever the first execution returned.
 func New(limit int) *Graph {
 	g := &Graph{
-		path: []string{},
+		tasks:   &sync.Map{},
+		errors:  &sync.Map{},
+		waiting: &sync.Map{},
+		path:    []string{},
 	}
 
 	if limit > 0 {
@@ -73,14 +82,20 @@ func New(limit int) *Graph {
 	return g
 }
 
-// Do does stuff.
-func (g *Graph) Do(ctx context.Context, key string, f func(context.Context, *Graph) error) error {
-	for _, p := range g.path {
-		if p == key {
-			return fmt.Errorf("cannot execute subgraph due to cycle: %s -> %s", strings.Join(g.path, " -> "), key)
-		}
-	}
+type CycleError struct {
+	key  string
+	path []string
+}
 
+func (e *CycleError) Error() string {
+	return fmt.Sprintf("cannot execute subgraph due to cycle: %s -> %s", strings.Join(e.path, " -> "), e.key)
+}
+
+// Do does stuff synchronously.
+func (g *Graph) Do(ctx context.Context, key string, f func(context.Context, *Graph) error) error {
+	if err := g.cycle(key); err != nil {
+		return err
+	}
 	v, loaded := g.tasks.LoadOrStore(key, newTask())
 	task := v.(*Task)
 	if loaded {
@@ -90,13 +105,7 @@ func (g *Graph) Do(ctx context.Context, key string, f func(context.Context, *Gra
 		}
 		task.Unlock()
 	} else {
-		subpath := slices.Clone(g.path)
-		subpath = append(subpath, key)
-		subgraph := &Graph{
-			tasks: g.tasks,
-			sem:   g.sem,
-			path:  subpath,
-		}
+		subgraph := g.subgraph(key)
 
 		g.errors.Store(key, f(ctx, subgraph))
 
@@ -110,69 +119,114 @@ func (g *Graph) Do(ctx context.Context, key string, f func(context.Context, *Gra
 	return g.error(key)
 }
 
-// Go is like Do but async.
-func (g *Graph) Go(ctx context.Context, key string, f func(context.Context, *Graph) error) {
+func (g *Graph) subgraph(key string) *Graph {
+	subpath := slices.Clone(g.path)
+	subpath = append(subpath, key)
+	return &Graph{
+		waiting: &sync.Map{},
+		tasks:   g.tasks,
+		errors:  g.errors,
+		sem:     g.sem,
+		path:    subpath,
+	}
+}
+
+// TODO: switch to map if path len is too big? benchmark it?
+func (g *Graph) cycle(key string) error {
 	for _, p := range g.path {
 		if p == key {
-			g.errOnce.Do(func() {
-				g.err = fmt.Errorf("cannot execute subgraph due to cycle: %s -> %s", strings.Join(g.path, " -> "), key)
-			})
-			return
+			return &CycleError{
+				key:  key,
+				path: g.path,
+			}
 		}
+	}
+
+	return nil
+}
+
+// Go does stuff asynchronously (think errgroup).
+func (g *Graph) Go(ctx context.Context, key string, f func(context.Context, *Graph) error) {
+	if err := g.cycle(key); err != nil {
+		g.errOnce.Do(func() {
+			g.err = err
+		})
+		return
 	}
 
 	v, loaded := g.tasks.LoadOrStore(key, newTask())
 	task := v.(*Task)
+	g.waiting.Store(key, task)
+
 	if loaded {
+		return
+	}
+
+	if g.sem != nil {
+		g.sem <- token{}
+	}
+
+	go func() {
+		err := f(ctx, g.subgraph(key))
+		g.errors.Store(key, err)
+		g.errOnce.Do(func() {
+			g.err = err
+		})
+
 		task.Lock()
-		if task.done {
-			task.Unlock()
-			return
-		}
-
-		g.wg.Add(1)
-		go func() {
-			defer g.wg.Done()
-
-			for !task.done {
-				task.cond.Wait()
-			}
-			task.Unlock()
-		}()
-	} else {
-		subpath := slices.Clone(g.path)
-		subpath = append(subpath, key)
-		subgraph := &Graph{
-			tasks: g.tasks,
-			sem:   g.sem,
-			path:  subpath,
-		}
+		task.done = true
 
 		if g.sem != nil {
-			g.sem <- token{}
-		}
-		g.wg.Add(1)
-		go func() {
-			defer g.wg.Done()
-
-			err := f(ctx, subgraph)
-			g.errors.Store(key, err)
-			g.errOnce.Do(func() {
-				g.err = err
-			})
-
-			task.Lock()
-			task.done = true
-			task.Unlock()
-
 			<-g.sem
+		}
 
-			task.cond.Broadcast()
-		}()
-	}
+		task.cond.Broadcast()
+		task.Unlock()
+	}()
 }
 
 func (g *Graph) Wait() error {
-	g.wg.Wait()
+	g.waiting.Range(func(k, v any) bool {
+		task := v.(*Task)
+
+		task.Lock()
+		defer task.Unlock()
+
+		for !task.done {
+			task.cond.Wait()
+		}
+
+		return true
+	})
+
+	return g.err
+}
+
+// spiking some notes, this one isn't used yet
+// need to make sure this makes sense but I wonder if we can "loan" the semaphore one unit
+// whenever we enter into a cond.Wait() so that we don't end up waiting indefinitely.
+func (g *Graph) wait() error {
+	g.waiting.Range(func(k, v any) bool {
+		task := v.(*Task)
+
+		// TODO: Would it ever make sense to TryLock?
+		task.Lock()
+		defer task.Unlock()
+
+		for !task.done {
+			if g.sem != nil {
+				<-g.sem
+			}
+
+			task.cond.Wait()
+
+			if g.sem != nil {
+				g.sem <- token{}
+			}
+		}
+
+		return true
+	})
+
 	return g.err
 }
