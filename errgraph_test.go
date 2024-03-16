@@ -66,3 +66,36 @@ func TestErrgraphDedupeWaiters(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestErrgraph(t *testing.T) {
+	g := errgraph.New(0)
+	ctx := context.Background()
+
+	s := ""
+
+	g.Go(ctx, "world", func(ctx context.Context, g *errgraph.Graph) error {
+		g.Go(ctx, "hello", func(ctx context.Context, g *errgraph.Graph) error {
+			s += "hello "
+			return nil
+		})
+		g.Go(ctx, "hello", func(ctx context.Context, g *errgraph.Graph) error {
+			s += "hello "
+			return nil
+		})
+
+		if err := g.Wait(); err != nil {
+			return err
+		}
+
+		s += "world"
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := s, "hello world"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

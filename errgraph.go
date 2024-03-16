@@ -185,6 +185,7 @@ func (g *Graph) Go(ctx context.Context, key string, f func(context.Context, *Gra
 	}()
 }
 
+// TODO: What happens if you Wait() twice?
 func (g *Graph) Wait() error {
 	g.waiting.Range(func(k, v any) bool {
 		task := v.(*Task)
